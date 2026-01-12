@@ -1,2 +1,3 @@
-# RCJJ
-test Files for RCJJ preparation
+RCJJ広島ブロック大会に使うコードを載せてます。
+Striker：今HiGAに那宇が持って帰ったKickできるロボット
+Defender：Kick機能は入ってないロボット。今呉の自宅にある。
