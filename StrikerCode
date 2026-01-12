@@ -1,0 +1,1439 @@
+// ============================================================
+// ESP32-S3 RCJJ: TFT + MCP23017(IR GPB) Ball Search + 23deg Post-Shift (Pulse)
+// + Front Ultrasonic(Trig4/Echo5) <= 5cm "Arrived at ball"
+// + Turn-to-Target(Buttons 47/48 set IMU target) with PULSE control (no continuous turn)
+//   - Keep idx in {0,7} while turning; if idx leaves -> SEARCH
+// + After turn done: keep driving forward as long as idx in {0,7}; if idx leaves -> SEARCH
+//
+// IMPORTANT per request:
+// - SEARCH_PULSE_PERIOD_MS = 300
+//
+// ✅ ADD (previous):
+// - While forward-driving states, if front ultrasonic <= 30cm => STOP immediately -> BACK 200ms -> SEARCH
+//
+// ✅ ADD (previous):
+// - While AUTO_SEARCH (left-turn pulse searching), if RIGHT wall (dist4) <= 20cm
+//   => do AVOID: 300ms "backward while turning right" -> back to SEARCH
+//
+// ✅ ADD (previous):
+// - If BACK ultrasonic dist3 <= 10cm => PRIORITY: forward 100ms, then resume previous state
+//
+// ✅ UI (previous):
+// - Show current AutoState text at TOP-RIGHT, moved 15px LEFT from previous box
+// - Color differs per state
+//
+// ✅ NEW (this request):
+// - On boot / anytime: press BTN47 or BTN48 to store "opponent-goal forward" heading (targetHdgDeg)
+// - While forward-driving, if GPA detects ball ONCE (GPA != 111) AND current heading is within ±80°
+//   of stored heading => fire solenoid GPIO39 HIGH for 500ms (non-blocking), then LOW.
+// ============================================================
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <math.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <Adafruit_MCP23X17.h>
+#include <Adafruit_BNO055.h>
+#include <utility/imumaths.h>
+
+// ================= TFT (SPI) =================
+#define TFT_SCLK 12
+#define TFT_MOSI 11
+#define TFT_CS   13
+#define TFT_DC   9
+#define TFT_RST  10
+#define TFT_BL   14
+
+SPIClass spi(FSPI);
+Adafruit_ST7789 tft(&spi, TFT_CS, TFT_DC, TFT_RST);
+static const int PANEL_W = 172;
+static const int PANEL_H = 320;
+
+static bool backTooCloseLatch = false;
+static const float BACK_CLEAR_CM = 12.0f; // 히스테리시스(10->12)
+static bool  rightWallLatch = false;
+static const float RIGHT_WALL_CLEAR_CM = 22.0f; // 20cm 발동 후 22cm 이상이면 해제
+
+// ================= Buttons =================
+#define BTN47_PIN 47
+#define BTN48_PIN 48
+static const uint32_t BTN_DEBOUNCE_MS = 35;
+static bool btn47_lastRead = true;
+static bool btn47_stable   = true;
+static uint32_t btn47_changeMs = 0;
+static bool btn48_lastRead = true;
+static bool btn48_stable   = true;
+static uint32_t btn48_changeMs = 0;
+
+enum BtnCircleType : uint8_t { CIRCLE_NONE=0, CIRCLE_RED=1, CIRCLE_WHITE=2 };
+static BtnCircleType circleType = CIRCLE_NONE;
+static uint32_t circleUntilMs = 0;
+static const uint32_t CIRCLE_SHOW_MS = 3000;
+
+// ================= Ultrasonic (D1~D4) =================
+// dist1 = FRONT, dist2 = LEFT, dist3 = BACK, dist4 = RIGHT
+#define TRIG_PIN 4
+#define ECHO_PIN 5
+#define TRIG_PIN2 6
+#define ECHO_PIN2 7
+#define TRIG_PIN3 15
+#define ECHO_PIN3 16
+#define TRIG_PIN4 8
+#define ECHO_PIN4 3
+
+static const uint32_t US_TIMEOUT_US = 12000; // 12ms
+static float dist1 = -1, dist2 = -1, dist3 = -1, dist4 = -1;
+static uint8_t usIndex = 0;
+
+static float readDistanceCM_timeout(int trigPin, int echoPin, uint32_t timeoutUs) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  unsigned long duration = pulseIn(echoPin, HIGH, timeoutUs);
+  if (duration == 0) return -1.0f;
+  return (float)duration * 0.0343f / 2.0f;
+}
+
+// Front ultrasonic sampling (dist1)
+static const uint32_t US_FRONT_PERIOD_MS = 80;
+static uint32_t lastUsFrontMs = 0;
+
+// Arrived threshold
+static const float ARRIVE_CM = 5.0f;
+
+// ✅ Wall detect threshold during forward + back duration
+static const float WALL_STOP_CM = 30.0f;
+static const uint32_t WALL_BACK_MS = 200;
+
+// ✅ Right wall avoid while searching
+static const float RIGHT_WALL_AVOID_CM = 25.0f;
+static const uint32_t RIGHT_AVOID_MS   = 350;
+
+// ✅ Back too close -> priority forward
+static const float BACK_TOO_CLOSE_CM = 10.0f;
+static const uint32_t BACK_FWD_MS    = 100;
+
+// ================= Solenoid (GPIO39) =================
+#define SOLENOID_PIN 39
+static void solenoidInit(){
+  pinMode(SOLENOID_PIN, OUTPUT);
+  digitalWrite(SOLENOID_PIN, LOW);
+}
+static void solenoidOff(){ digitalWrite(SOLENOID_PIN, LOW); }
+
+// Kick timing (non-blocking)
+static const uint32_t SOLENOID_ON_MS = 500;
+static bool solenoidActive = false;
+static uint32_t solenoidUntilMs = 0;
+static uint32_t solenoidCooldownUntilMs = 0;
+static const uint32_t SOLENOID_COOLDOWN_MS = 250; // 연속 재발동 방지(최소 간격)
+
+// ================= I2C (shared) =================
+#define I2C_SDA_PIN  18
+#define I2C_SCL_PIN  17
+
+// ================= MCP23017 (I2C) =================
+#define MCP_ADDR     0x20
+Adafruit_MCP23X17 mcp;
+constexpr uint8_t GPA_START = 0;
+constexpr uint8_t GPA_COUNT = 3;
+constexpr uint8_t GPB_START = 8;
+constexpr uint8_t GPB_COUNT = 8;
+
+// ================= BNO055 (I2C) =================
+Adafruit_BNO055 bno(55, 0x28);
+static const float MAG_MIN_uT = 25.0f;
+static const float MAG_MAX_uT = 65.0f;
+
+// ================= UI Layout =================
+static const int IND_W = 80;
+
+// ================= UI: Circle + Arrow =================
+static int r = 0;
+static int cx = 0, cy = 0;
+static float arrowDeg = 0.0f;
+
+// HDG arrow (red)
+static float headingArrowDeg = 0.0f;
+static float prevHeadingArrowDeg = 0.0f;
+
+// tHDG arrow (green; 표시용)
+static bool  targetHdgSet = false;
+static float targetHdgDeg = 0.0f;
+static float prevTargetArrowDeg = 0.0f;
+
+// ================= Right-side Cross Table =================
+struct Cell { int x, y, w, h; };
+static Cell cellCenter, cellUp, cellDown, cellLeft, cellRight;
+
+// IR text
+static int irTextX = 0, irTextY = 0, irTextW = 0, irTextH = 0;
+static uint8_t lastGPA = 0x07;
+static uint8_t lastGPB = 0xFF;
+
+// Heading text
+static int hdgTextX = 0, hdgTextY = 0, hdgTextW = 0, hdgTextH = 0;
+
+// Target heading text
+static int thdgTextX = 0, thdgTextY = 0, thdgTextW = 0, thdgTextH = 0;
+
+// IDX text
+static int idxTextX = 0, idxTextY = 0, idxTextW = 0, idxTextH = 0;
+
+// timing
+static uint32_t lastLcdMs = 0;
+static const uint32_t LCD_UPDATE_MS = 250;
+static uint32_t lastIrPollMs = 0;
+static const uint32_t IR_POLL_MS = 10;
+
+// mode counter (1s window) for arrow smoothing
+static uint8_t dirCount[8] = {0};
+static uint32_t modeWindowStartMs = 0;
+static const uint32_t MODE_WINDOW_MS = 1000;
+
+static void resetModeWindow() {
+  memset(dirCount, 0, sizeof(dirCount));
+  modeWindowStartMs = millis();
+}
+static int getModeIndex() {
+  int bestIdx = -1;
+  uint8_t bestCnt = 0;
+  for (int i = 0; i < 8; i++) {
+    if (dirCount[i] > bestCnt) { bestCnt = dirCount[i]; bestIdx = i; }
+  }
+  return (bestCnt == 0) ? -1 : bestIdx;
+}
+
+// ================= Helpers =================
+static float wrap360(float deg){
+  while (deg < 0.0f) deg += 360.0f;
+  while (deg >= 360.0f) deg -= 360.0f;
+  return deg;
+}
+static float cwDiffDeg(float cur, float target){
+  float d = target - cur;
+  while (d < 0.0f) d += 360.0f;
+  while (d >= 360.0f) d -= 360.0f;
+  return d; // 0..360
+}
+static float signedDiffDeg(float cur, float target){
+  float d = target - cur;
+  while (d > 180.0f) d -= 360.0f;
+  while (d < -180.0f) d += 360.0f;
+  return d; // -180..+180
+}
+
+// ================= Draw primitives =================
+static void drawThinShortArrow(int cx, int cy, int length, float deg, uint16_t color) {
+  float rad = deg * (3.14159265f / 180.0f);
+  int x2 = cx + (int)(length * cosf(rad));
+  int y2 = cy + (int)(length * sinf(rad));
+  tft.drawLine(cx, cy, x2, y2, color);
+  int headLen = max(10, length / 3);
+  float headAng = 28.0f * (3.14159265f / 180.0f);
+  int hx1 = x2 - (int)(headLen * cosf(rad - headAng));
+  int hy1 = y2 - (int)(headLen * sinf(rad - headAng));
+  int hx2 = x2 - (int)(headLen * cosf(rad + headAng));
+  int hy2 = y2 - (int)(headLen * sinf(rad + headAng));
+  tft.fillTriangle(x2, y2, hx1, hy1, hx2, hy2, color);
+}
+static void drawThickArrow(int cx, int cy, int length, float deg, int thickness, uint16_t color) {
+  float rad = deg * (3.14159265f / 180.0f);
+  int x2 = cx + (int)(length * cosf(rad));
+  int y2 = cy + (int)(length * sinf(rad));
+  float nx = -sinf(rad);
+  float ny =  cosf(rad);
+  for (int i = -thickness / 2; i <= thickness / 2; i++) {
+    int ox = (int)(nx * i);
+    int oy = (int)(ny * i);
+    tft.drawLine(cx + ox, cy + oy, x2 + ox, y2 + oy, color);
+  }
+  int headLen = max(26, length / 2);
+  float headAng = 40.0f * (3.14159265f / 180.0f);
+  int hx1 = x2 - (int)(headLen * cosf(rad - headAng));
+  int hy1 = y2 - (int)(headLen * sinf(rad - headAng));
+  int hx2 = x2 - (int)(headLen * cosf(rad + headAng));
+  int hy2 = y2 - (int)(headLen * sinf(rad + headAng));
+  tft.fillTriangle(x2, y2, hx1, hy1, hx2, hy2, color);
+}
+
+// ================= Cross table =================
+static void drawCellBorder(const Cell& c, uint16_t color) { tft.drawRect(c.x, c.y, c.w, c.h, color); }
+static void drawTextCenteredInCell(const Cell& c, const String& s, uint16_t color) {
+  int pad = 1;
+  tft.fillRect(c.x + pad, c.y + pad, c.w - pad * 2, c.h - pad * 2, ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(color, ST77XX_BLACK);
+  int16_t x1, y1; uint16_t tw, th;
+  tft.getTextBounds(s, 0, 0, &x1, &y1, &tw, &th);
+  int tx = c.x + (c.w - (int)tw) / 2;
+  int ty = c.y + (c.h - (int)th) / 2;
+  tft.setCursor(tx, ty);
+  tft.print(s);
+}
+static void drawValueInCellRoundedCM(const Cell& c, float v) {
+  if (v < 0) {
+    drawTextCenteredInCell(c, "---", ST77XX_CYAN);
+    drawCellBorder(c, ST77XX_WHITE);
+    return;
+  }
+  int cm = (int)lroundf(v);
+  uint16_t textColor   = (cm <= 10) ? ST77XX_RED  : ST77XX_CYAN;
+  uint16_t borderColor = (cm <= 10) ? ST77XX_RED  : ST77XX_WHITE;
+  drawTextCenteredInCell(c, String(cm), textColor);
+  drawCellBorder(c, borderColor);
+}
+static void drawCrossTableStatic() {
+  int cellW = 50, cellH = 22, gap = 4;
+  int tableTotalW = 3 * cellW + 2 * gap;
+  int tableX0_byCircle = cx + r + 18;
+  int tableX0_maxRight = tft.width() - IND_W - tableTotalW;
+  int tableX0 = min(tableX0_byCircle, tableX0_maxRight);
+  if (tableX0 < 0) tableX0 = 0;
+  int tableY0 = 0;
+  cellCenter = { tableX0 + cellW + gap, tableY0 + cellH + gap, cellW, cellH };
+  cellUp     = { cellCenter.x,                 cellCenter.y - (cellH + gap), cellW, cellH };
+  cellDown   = { cellCenter.x,                 cellCenter.y + (cellH + gap), cellW, cellH };
+  cellLeft   = { cellCenter.x - (cellW + gap), cellCenter.y,                 cellW, cellH };
+  cellRight  = { cellCenter.x + (cellW + gap), cellCenter.y,                 cellW, cellH };
+  tft.drawRect(cellUp.x,     cellUp.y,     cellUp.w,     cellUp.h,     ST77XX_WHITE);
+  tft.drawRect(cellDown.x,   cellDown.y,   cellDown.w,   cellDown.h,   ST77XX_WHITE);
+  tft.drawRect(cellLeft.x,   cellLeft.y,   cellLeft.w,  cellLeft.h,    ST77XX_WHITE);
+  tft.drawRect(cellRight.x,  cellRight.y,  cellRight.w, cellRight.h,   ST77XX_WHITE);
+  tft.drawRect(cellCenter.x, cellCenter.y, cellCenter.w, cellCenter.h, ST77XX_WHITE);
+  drawTextCenteredInCell(cellCenter, "dist=cm", ST77XX_YELLOW);
+  drawTextCenteredInCell(cellUp,    "---", ST77XX_CYAN);
+  drawTextCenteredInCell(cellRight, "---", ST77XX_CYAN);
+  drawTextCenteredInCell(cellLeft,  "---", ST77XX_CYAN);
+  drawTextCenteredInCell(cellDown,  "---", ST77XX_CYAN);
+}
+
+// ================= IR text =================
+static void drawIRText(uint8_t gpa3, uint8_t gpb8) {
+  tft.fillRect(irTextX, irTextY, irTextW, irTextH, ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+  tft.setCursor(irTextX, irTextY);
+  tft.print("GPA=");
+  for (int i = 2; i >= 0; i--) tft.print((gpa3 & (1 << i)) ? '1' : '0');
+  tft.setCursor(irTextX, irTextY + 12);
+  tft.print("GPB=");
+  for (int i = 7; i >= 0; i--) tft.print((gpb8 & (1 << i)) ? '1' : '0');
+}
+static void drawIDXText(int idx) {
+  tft.fillRect(idxTextX, idxTextY, idxTextW, idxTextH, ST77XX_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+  tft.setCursor(idxTextX, idxTextY);
+  tft.print("IDX=");
+  if (idx < 0) tft.print("---");
+  else tft.print(idx);
+}
+
+// ================= HDG text + tHDG text =================
+static void drawHeadingTextColored(const String& s, uint16_t color) {
+  tft.fillRect(hdgTextX, hdgTextY, hdgTextW, hdgTextH, ST77XX_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(color, ST77XX_BLACK);
+  tft.setCursor(hdgTextX, hdgTextY);
+  tft.print("HDG=");
+  tft.print(s);
+}
+static void drawTargetHeadingText() {
+  tft.fillRect(thdgTextX, thdgTextY, thdgTextW, thdgTextH, ST77XX_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
+  tft.setCursor(thdgTextX, thdgTextY);
+  if (!targetHdgSet) tft.print("tHDG=---");
+  else { tft.print("tHDG="); tft.print(targetHdgDeg, 1); }
+}
+
+// ============================================================
+// MCP23017 fast read
+// ============================================================
+static inline void readMCP_AB_fast(uint8_t &outGPA3, uint8_t &outGPB8) {
+  uint16_t ab = mcp.readGPIOAB();
+  uint8_t a = (uint8_t)(ab & 0xFF);
+  uint8_t b = (uint8_t)((ab >> 8) & 0xFF);
+  outGPA3 = a & 0x07;
+  outGPB8 = b;
+}
+static int gpbToIndex(uint8_t gpb) {
+  for (int i = 0; i < 8; i++) {
+    if (((gpb >> i) & 0x01) == 0) return i; // active-low
+  }
+  return -1;
+}
+static float wrap360_local(float deg){
+  while (deg < 0.0f) deg += 360.0f;
+  while (deg >= 360.0f) deg -= 360.0f;
+  return deg;
+}
+static float indexToDeg(int idx) {
+  float deg = -22.5f - 45.0f * (float)idx;
+  return wrap360_local(deg);
+}
+
+// ================= IR Robust Filter =================
+static int irStableIdx = -1;
+static int irPendingIdx = -1;
+static uint8_t irPendingCount = 0;
+static const uint8_t NORMAL_CONFIRM_N = 2;
+static const uint8_t FLIP_CONFIRM_N   = 6;
+static const uint8_t IR_HIST_N = 8;
+static int irHist[IR_HIST_N] = { -1,-1,-1,-1,-1,-1,-1,-1 };
+static uint8_t irHistPos = 0;
+
+static void pushIrHist(int v) {
+  irHist[IR_HIST_N ? irHistPos : 0] = v;
+  irHistPos = (irHistPos + 1) % IR_HIST_N;
+}
+static int applyNeighborBiasIfFlipSuspect(int candidate) {
+  if (!(candidate == 7 || candidate == 3)) return candidate;
+  int cnt7side = 0, cnt3side = 0;
+  for (uint8_t i = 0; i < IR_HIST_N; i++) {
+    int v = irHist[i];
+    if (v == 6 || v == 0) cnt7side++;
+    if (v == 2 || v == 4) cnt3side++;
+  }
+  if (cnt7side > cnt3side) return 7;
+  if (cnt3side > cnt7side) return 3;
+  return candidate;
+}
+static int filterIRIndex(int rawIdx) {
+  if (rawIdx >= 0 && rawIdx <= 7) pushIrHist(rawIdx);
+  if (rawIdx < 0 || rawIdx > 7) {
+    irPendingIdx = -1; irPendingCount = 0;
+    return irStableIdx;
+  }
+  if (irStableIdx < 0) {
+    irStableIdx = rawIdx;
+    irPendingIdx = -1; irPendingCount = 0;
+    return irStableIdx;
+  }
+  int biasedRaw = applyNeighborBiasIfFlipSuspect(rawIdx);
+  if (biasedRaw == irStableIdx) {
+    irPendingIdx = -1; irPendingCount = 0;
+    return irStableIdx;
+  }
+  if (biasedRaw != irPendingIdx) {
+    irPendingIdx = biasedRaw;
+    irPendingCount = 1;
+  } else {
+    if (irPendingCount < 255) irPendingCount++;
+  }
+  bool isFlipPair =
+    ((irStableIdx == 7 && irPendingIdx == 3) || (irStableIdx == 3 && irPendingIdx == 7));
+  uint8_t need = isFlipPair ? FLIP_CONFIRM_N : NORMAL_CONFIRM_N;
+  if (irPendingCount >= need) {
+    irStableIdx = irPendingIdx;
+    irPendingIdx = -1;
+    irPendingCount = 0;
+  }
+  irStableIdx = applyNeighborBiasIfFlipSuspect(irStableIdx);
+  return irStableIdx;
+}
+
+// ================= Button debounced press =================
+static bool pollPressedOnce(uint8_t pin, bool &lastRead, bool &stable, uint32_t &chgMs) {
+  bool raw = digitalRead(pin);
+  if (raw != lastRead) { lastRead = raw; chgMs = millis(); }
+  if (millis() - chgMs >= BTN_DEBOUNCE_MS) {
+    if (stable != raw) {
+      bool prev = stable;
+      stable = raw;
+      if (prev == HIGH && stable == LOW) return true;
+    }
+  }
+  return false;
+}
+
+// ================= Button circle overlay =================
+static void drawButtonCircleOverlay(uint32_t now) {
+  int boxX = tft.width() - 30;
+  int boxY = tft.height() - 30;
+  tft.fillRect(boxX, boxY, 30, 30, ST77XX_BLACK);
+  if (circleType == CIRCLE_NONE) return;
+  if (now >= circleUntilMs) { circleType = CIRCLE_NONE; return; }
+  int x = tft.width()  - 12;
+  int y = tft.height() - 12;
+  int rr = 8;
+  uint16_t col = (circleType == CIRCLE_RED) ? ST77XX_RED : ST77XX_WHITE;
+  tft.fillCircle(x, y, rr, col);
+}
+
+// ================= GPA blue circle overlay (표시만) =================
+enum GPABlueState : uint8_t { GPA_OFF=0, GPA_SOLID=1, GPA_GHOST=2 };
+static GPABlueState gpaState = GPA_OFF;
+static GPABlueState prevGpaState = GPA_OFF;
+static uint32_t solidUntilMs = 0;
+static uint32_t ghostUntilMs = 0;
+static uint8_t gpaDetHist = 0;
+static const uint8_t GPA_HIST_N = 5;
+static const uint8_t GPA_CONFIRM_K = 2;
+static const uint32_t GPA_SOLID_MS = 1000;
+static const uint32_t GPA_GHOST_MS = 3000;
+static bool gpaConfirmedDetect = false;
+
+static uint8_t popcount8(uint8_t x) {
+  uint8_t c = 0;
+  while (x) { c += (x & 1); x >>= 1; }
+  return c;
+}
+static void drawGPABlueCircleOverlay(GPABlueState st) {
+  const int boxW = IND_W;
+  const int boxH = 60;
+  const int gap  = 6;
+  const int btnBoxH = 30;
+  const int boxX = tft.width() - boxW;
+  const int boxY = tft.height() - btnBoxH - gap - boxH;
+  tft.fillRect(boxX, boxY, boxW, boxH, ST77XX_BLACK);
+  if (st == GPA_OFF) return;
+  const int rr = 24;
+  const int SHIFT_LEFT = 20;
+  int x = boxX + boxW / 2 - SHIFT_LEFT;
+  int y = boxY + boxH / 2;
+  if (x < boxX + rr) x = boxX + rr;
+  if (x > boxX + boxW - rr) x = boxX + boxW - rr;
+  if (st == GPA_SOLID) tft.fillCircle(x, y, rr, ST77XX_BLUE);
+  else {
+    tft.drawCircle(x, y, rr,   ST77XX_BLUE);
+    tft.drawCircle(x, y, rr-1, ST77XX_BLUE);
+  }
+}
+
+// ================= Heading: fast then stable =================
+static bool readHeadingApproxDeg(float &outDeg){
+  imu::Vector<3> euler = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
+  float h = euler.x();
+  if (!isfinite(h)) return false;
+  outDeg = wrap360(h);
+  return true;
+}
+static bool readHeadingReliableDeg(float& outDeg) {
+  uint8_t sys, gyro, accel, mag;
+  bno.getCalibration(&sys, &gyro, &accel, &mag);
+  if (sys < 2 || mag < 2) return false;
+  imu::Vector<3> magVec = bno.getVector(Adafruit_BNO055::VECTOR_MAGNETOMETER);
+  float magNorm = sqrtf(magVec.x()*magVec.x() + magVec.y()*magVec.y() + magVec.z()*magVec.z());
+  if (magNorm < MAG_MIN_uT || magNorm > MAG_MAX_uT) return false;
+  imu::Vector<3> euler = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
+  float h = euler.x();
+  if (!isfinite(h)) return false;
+  outDeg = wrap360(h);
+  return true;
+}
+static bool getHeadingFastThenStable(float &outDeg, bool &hasValue){
+  hasValue = false;
+  if (readHeadingReliableDeg(outDeg)){ hasValue = true; return true; }
+  if (readHeadingApproxDeg(outDeg)){   hasValue = true; return false; }
+  return false;
+}
+
+// ============================================================
+// ====================== MOTOR CONTROL =======================
+// ============================================================
+#define M1_IN1 35
+#define M1_IN2 36
+#define M2_IN1 37
+#define M2_IN2 38
+static const int PWM_FREQ = 20000;
+static const int PWM_RES  = 8;
+static const int CH_M1_A  = 0;
+static const int CH_M1_B  = 1;
+static const int CH_M2_A  = 2;
+static const int CH_M2_B  = 3;
+
+// 모터별 보정
+static const float M1_SCALER = 1.00f;
+static const float M2_SCALER = 0.952f;
+static const bool M1_INVERT = false;
+static const bool M2_INVERT = true;
+
+static void motorInit() {
+  pinMode(M1_IN1, OUTPUT); pinMode(M1_IN2, OUTPUT);
+  pinMode(M2_IN1, OUTPUT); pinMode(M2_IN2, OUTPUT);
+  ledcSetup(CH_M1_A, PWM_FREQ, PWM_RES);
+  ledcSetup(CH_M1_B, PWM_FREQ, PWM_RES);
+  ledcSetup(CH_M2_A, PWM_FREQ, PWM_RES);
+  ledcSetup(CH_M2_B, PWM_FREQ, PWM_RES);
+  ledcAttachPin(M1_IN1, CH_M1_A);
+  ledcAttachPin(M1_IN2, CH_M1_B);
+  ledcAttachPin(M2_IN1, CH_M2_A);
+  ledcAttachPin(M2_IN2, CH_M2_B);
+  ledcWrite(CH_M1_A, 0); ledcWrite(CH_M1_B, 0);
+  ledcWrite(CH_M2_A, 0); ledcWrite(CH_M2_B, 0);
+}
+static void motorStop() {
+  ledcWrite(CH_M1_A, 0); ledcWrite(CH_M1_B, 0);
+  ledcWrite(CH_M2_A, 0); ledcWrite(CH_M2_B, 0);
+}
+static void m1Drive(int16_t spd){
+  float scaledSpd = (float)spd * M1_SCALER;
+  int16_t finalSpd = (int16_t)constrain(scaledSpd, -255, 255);
+  bool fwd = (finalSpd >= 0);
+  uint8_t duty = (uint8_t)abs(finalSpd);
+  if (M1_INVERT) fwd = !fwd;
+  if (duty == 0) { ledcWrite(CH_M1_A, 0); ledcWrite(CH_M1_B, 0); return; }
+  if (fwd) { ledcWrite(CH_M1_A, duty); ledcWrite(CH_M1_B, 0); }
+  else     { ledcWrite(CH_M1_A, 0);    ledcWrite(CH_M1_B, duty); }
+}
+static void m2Drive(int16_t spd){
+  float scaledSpd = (float)spd * M2_SCALER;
+  int16_t finalSpd = (int16_t)constrain(scaledSpd, -255, 255);
+  bool fwd = (finalSpd >= 0);
+  uint8_t duty = (uint8_t)abs(finalSpd);
+  if (M2_INVERT) fwd = !fwd;
+  if (duty == 0) { ledcWrite(CH_M2_A, 0); ledcWrite(CH_M2_B, 0); return; }
+  if (fwd) { ledcWrite(CH_M2_A, duty); ledcWrite(CH_M2_B, 0); }
+  else     { ledcWrite(CH_M2_A, 0);    ledcWrite(CH_M2_B, duty); }
+}
+
+// ===================== Pulse turn params =====================
+static const uint16_t SEARCH_PULSE_PERIOD_MS = 300;
+static const uint16_t SEARCH_ON_MS_NEAR      = 80;
+static const uint16_t SEARCH_ON_MS_FAR       = 100;
+static const uint8_t  DUTY_SEARCH_PULSE      = (uint8_t)lroundf(255.0f * 0.16f);
+
+static const uint16_t SHIFT_PULSE_PERIOD_MS  = 200;
+static const uint16_t SHIFT_PULSE_ON_MS      = 30;
+static const uint8_t  DUTY_SHIFT_PULSE       = (uint8_t)lroundf(255.0f * 0.16f);
+
+static const float SHIFT_DEG      = 23.0f;
+static const float SHIFT_TOL_DEG  = 5.0f;
+
+static const uint32_t STEP_FWD_MS  = 400;
+static const uint32_t STEP_STOP_MS = 500;
+
+static const float TARGET_TOL_DEG = 5.0f;
+static const uint32_t TARGET_SETTLE_MS = 100;
+
+static const uint16_t TURN_PULSE_PERIOD_MS = 200;
+static const uint16_t TURN_PULSE_ON_MS     = 25;
+static const uint8_t  DUTY_TURN_PULSE      = (uint8_t)lroundf(255.0f * 0.16f);
+
+static const uint8_t DUTY_FWD = (uint8_t)lroundf(255.0f * 0.18f);
+
+// forward/back helpers
+static void motorForwardFixed(uint8_t duty){
+  if (duty == 0) { motorStop(); return; }
+  m1Drive((int16_t)duty);
+  m2Drive((int16_t)duty);
+}
+static void motorBackwardFixed(uint8_t duty){
+  if (duty == 0) { motorStop(); return; }
+  m1Drive(-(int16_t)duty);
+  m2Drive(-(int16_t)duty);
+}
+// backward while turning right (arc)
+static void motorBackRightArc(uint8_t duty){
+  uint8_t dR = (uint8_t)max(1, (int)duty / 2);
+  m1Drive(-(int16_t)duty);
+  m2Drive(-(int16_t)dR);
+}
+
+// ===================== Pulse turn helpers =====================
+static void motorTurnLeftPulse(uint32_t now, uint32_t &cycleStartMs, uint16_t periodMs, uint16_t onMs, uint8_t duty){
+  if (cycleStartMs == 0) cycleStartMs = now;
+  if ((uint32_t)(now - cycleStartMs) >= periodMs) {
+    uint32_t k = (now - cycleStartMs) / periodMs;
+    cycleStartMs += k * periodMs;
+  }
+  uint32_t phase = (uint32_t)(now - cycleStartMs);
+  if (phase < onMs) {
+    int16_t d = (int16_t)duty;
+    m1Drive(+d);
+    m2Drive(-d);
+  } else {
+    motorStop();
+  }
+}
+static void motorTurnPulseDir(uint32_t now,
+                              uint32_t &cycleStartMs,
+                              uint16_t periodMs,
+                              uint16_t onMs,
+                              uint8_t duty,
+                              int dir)
+{
+  if (cycleStartMs == 0) cycleStartMs = now;
+  if ((uint32_t)(now - cycleStartMs) >= periodMs) {
+    uint32_t k = (now - cycleStartMs) / periodMs;
+    cycleStartMs += k * periodMs;
+  }
+  uint32_t phase = (uint32_t)(now - cycleStartMs);
+  if (phase < onMs) {
+    int16_t d = (int16_t)duty;
+    if (dir >= 0) { m1Drive(+d); m2Drive(-d); }
+    else          { m1Drive(-d); m2Drive(+d); }
+  } else {
+    motorStop();
+  }
+}
+
+// ===================== State machine =====================
+enum AutoState : uint8_t {
+  AUTO_SEARCH = 0,
+  AUTO_SHIFT  = 1,
+  AUTO_STEP_FWD = 2,
+  AUTO_TURN_TO_TARGET = 3,
+  AUTO_DRIVE_AFTER_TURN = 4,
+  AUTO_BACK_FROM_WALL = 5,
+  AUTO_AVOID_RIGHT_WALL = 6,
+  AUTO_FWD_FROM_BACK = 7
+};
+
+static AutoState autoState = AUTO_SEARCH;
+
+static uint32_t searchPulseStartMs = 0;
+static uint32_t shiftPulseStartMs  = 0;
+static float shiftStartDeg  = 0.0f;
+static float shiftTargetDeg = 0.0f;
+static bool  shiftArmed     = false;
+static int g_latestFilteredIdx = -1;
+
+enum StepPhase : uint8_t { PH_FWD=0, PH_STOP=1 };
+static StepPhase stepPhase = PH_FWD;
+static uint32_t stepPhaseStartMs = 0;
+
+static uint32_t targetInTolSinceMs = 0;
+static uint32_t turnPulseStartMs   = 0;
+static int      turnDirFixed       = 0;
+
+static uint32_t wallBackStartMs = 0;
+static uint32_t rightAvoidStartMs = 0;
+
+// resume mechanism for back-priority-forward
+static AutoState resumeState = AUTO_SEARCH;
+static uint32_t backFwdStartMs = 0;
+
+// ===================== UI: State text (TOP-RIGHT) =====================
+static int stateTextX = 0, stateTextY = 0, stateTextW = 0, stateTextH = 0;
+static AutoState prevStateDrawn = (AutoState)255;
+
+static const char* autoStateName(AutoState s){
+  switch (s) {
+    case AUTO_SEARCH:           return "SEARCH";
+    case AUTO_SHIFT:            return "SHIFT";
+    case AUTO_STEP_FWD:         return "STEP_FWD";
+    case AUTO_TURN_TO_TARGET:   return "TURN_TGT";
+    case AUTO_DRIVE_AFTER_TURN: return "DRIVE";
+    case AUTO_BACK_FROM_WALL:   return "BACK_W";
+    case AUTO_AVOID_RIGHT_WALL: return "AVOID_R";
+    case AUTO_FWD_FROM_BACK:    return "BACK->F";
+    default:                    return "UNKNOWN";
+  }
+}
+static uint16_t autoStateColor(AutoState s){
+  switch (s) {
+    case AUTO_SEARCH:           return ST77XX_CYAN;
+    case AUTO_SHIFT:            return ST77XX_YELLOW;
+    case AUTO_STEP_FWD:         return ST77XX_WHITE;
+    case AUTO_TURN_TO_TARGET:   return ST77XX_GREEN;
+    case AUTO_DRIVE_AFTER_TURN: return ST77XX_MAGENTA;
+    case AUTO_BACK_FROM_WALL:   return ST77XX_RED;
+    case AUTO_AVOID_RIGHT_WALL: return ST77XX_ORANGE;
+    case AUTO_FWD_FROM_BACK:    return ST77XX_BLUE;
+    default:                    return ST77XX_WHITE;
+  }
+}
+static void drawStateText(AutoState s, bool force=false){
+  if (!force && s == prevStateDrawn) return;
+  prevStateDrawn = s;
+  uint16_t col = autoStateColor(s);
+  tft.fillRect(stateTextX, stateTextY, stateTextW, stateTextH, ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(col, ST77XX_BLACK);
+  tft.setCursor(stateTextX + 2, stateTextY + 2);
+  tft.print("ST:");
+  tft.print(autoStateName(s));
+  tft.drawRect(stateTextX, stateTextY, stateTextW, stateTextH, col);
+}
+
+// ===================== KICK gating =====================
+static const float KICK_FORWARD_WINDOW_DEG = 80.0f;
+
+static bool isForwardDrivingNow() {
+  // "전진제어" 중에만 킥: STEP_FWD의 FWD 페이즈 또는 DRIVE_AFTER_TURN에서만
+  if (autoState == AUTO_STEP_FWD) return (stepPhase == PH_FWD);
+  if (autoState == AUTO_DRIVE_AFTER_TURN) return true;
+  return false;
+}
+static bool isHeadingWithinGoalWindow(float curHdg) {
+  if (!targetHdgSet) return false;
+  float e = signedDiffDeg(curHdg, targetHdgDeg);
+  return fabsf(e) <= KICK_FORWARD_WINDOW_DEG;
+}
+static void startKick(uint32_t now){
+  solenoidActive = true;
+  solenoidUntilMs = now + SOLENOID_ON_MS;
+  solenoidCooldownUntilMs = solenoidUntilMs + SOLENOID_COOLDOWN_MS;
+  digitalWrite(SOLENOID_PIN, HIGH);
+  Serial.println("[KICK] SOLENOID HIGH 500ms");
+}
+static void updateKick(uint32_t now){
+  if (solenoidActive && (int32_t)(now - solenoidUntilMs) >= 0) {
+    solenoidActive = false;
+    digitalWrite(SOLENOID_PIN, LOW);
+    Serial.println("[KICK] SOLENOID LOW");
+  }
+}
+
+// ================= Static UI =================
+static void drawStaticUI() {
+  tft.fillScreen(ST77XX_BLACK);
+
+  r = min(tft.width(), tft.height()) / 4;
+  int margin = 10;
+  cx = r + margin;
+  cy = tft.height() / 2;
+
+  tft.drawCircle(cx, cy, r,     ST77XX_RED);
+  tft.drawCircle(cx, cy, r - 1, ST77XX_RED);
+
+  tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(cx - 20, cy - r - 30);
+  tft.print("Ball");
+
+  arrowDeg = 0.0f;
+  drawThickArrow(cx, cy, r - 2, arrowDeg, 6, ST77XX_YELLOW);
+
+  headingArrowDeg = 0.0f;
+  prevHeadingArrowDeg = headingArrowDeg;
+  drawThinShortArrow(cx, cy, (int)(r * 0.55f), headingArrowDeg, ST77XX_RED);
+
+  targetHdgSet = false;
+  prevTargetArrowDeg = 0.0f;
+
+  drawCrossTableStatic();
+
+  // TOP-RIGHT state box (moved 15px left)
+  stateTextW = IND_W;
+  stateTextH = 14;
+  stateTextX = (tft.width() - stateTextW) - 15;
+  if (stateTextX < 0) stateTextX = 0;
+  stateTextY = 0;
+  drawStateText(autoState, true);
+
+  int tableBottom = cellDown.y + cellDown.h;
+  const int TEXT_SHIFT_RIGHT = 20;
+  const int maxRight = tft.width() - IND_W;
+
+  irTextX = cellLeft.x + TEXT_SHIFT_RIGHT;
+  if (irTextX > maxRight - 10) irTextX = maxRight - 10;
+  irTextY = tableBottom + 8;
+  irTextH = 28;
+  irTextW = maxRight - irTextX;
+  if (irTextW < 10) irTextW = 10;
+
+  hdgTextX = irTextX;
+  hdgTextY = irTextY + irTextH + 6;
+  hdgTextW = irTextW;
+  hdgTextH = 22;
+
+  thdgTextX = hdgTextX;
+  thdgTextY = hdgTextY + hdgTextH + 6;
+  thdgTextW = hdgTextW;
+  thdgTextH = 22;
+
+  idxTextX = thdgTextX;
+  idxTextY = thdgTextY + thdgTextH + 6;
+  idxTextW = thdgTextW;
+  idxTextH = 22;
+
+  // 초기 표시
+  tft.fillRect(irTextX, irTextY, irTextW, irTextH, ST77XX_BLACK);
+  tft.fillRect(hdgTextX, hdgTextY, hdgTextW, hdgTextH, ST77XX_BLACK);
+  tft.fillRect(thdgTextX, thdgTextY, thdgTextW, thdgTextH, ST77XX_BLACK);
+  tft.fillRect(idxTextX, idxTextY, idxTextW, idxTextH, ST77XX_BLACK);
+
+  // placeholders
+  // (함수들은 아래 loop에서 사용)
+}
+
+// ================= setup/loop =================
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("boot ok");
+
+  pinMode(BTN47_PIN, INPUT_PULLUP);
+  pinMode(BTN48_PIN, INPUT_PULLUP);
+
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
+
+  spi.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
+  tft.init(PANEL_W, PANEL_H);
+  tft.setRotation(1);
+
+  drawStaticUI();
+
+  pinMode(TRIG_PIN, OUTPUT);  pinMode(ECHO_PIN, INPUT);
+  pinMode(TRIG_PIN2, OUTPUT); pinMode(ECHO_PIN2, INPUT);
+  pinMode(TRIG_PIN3, OUTPUT); pinMode(ECHO_PIN3, INPUT);
+  pinMode(TRIG_PIN4, OUTPUT); pinMode(ECHO_PIN4, INPUT);
+
+  digitalWrite(TRIG_PIN, LOW);
+  digitalWrite(TRIG_PIN2, LOW);
+  digitalWrite(TRIG_PIN3, LOW);
+  digitalWrite(TRIG_PIN4, LOW);
+
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(400000);
+
+  if (!mcp.begin_I2C(MCP_ADDR)) {
+    Serial.println("MCP23017 init failed!");
+    while (1) delay(10);
+  }
+  for (uint8_t i = 0; i < GPA_COUNT; i++) mcp.pinMode(GPA_START + i, INPUT_PULLUP);
+  for (uint8_t i = 0; i < GPB_COUNT; i++) mcp.pinMode(GPB_START + i, INPUT_PULLUP);
+
+  if (!bno.begin()) {
+    Serial.println("BNO055 init failed!");
+    while (1) delay(10);
+  }
+  delay(200);
+  bno.setExtCrystalUse(true);
+  bno.setMode(OPERATION_MODE_CONFIG); delay(20);
+  bno.setMode(OPERATION_MODE_NDOF);   delay(50);
+
+  motorInit();
+  motorStop();
+
+  solenoidInit();
+  solenoidOff();
+
+  solenoidActive = false;
+  solenoidUntilMs = 0;
+  solenoidCooldownUntilMs = 0;
+
+  lastLcdMs = millis() - LCD_UPDATE_MS;
+  lastIrPollMs = millis();
+  resetModeWindow();
+
+  irStableIdx = -1;
+  irPendingIdx = -1;
+  irPendingCount = 0;
+  for (uint8_t i=0;i<IR_HIST_N;i++) irHist[i] = -1;
+  irHistPos = 0;
+
+  gpaState = GPA_OFF;
+  prevGpaState = GPA_OFF;
+  solidUntilMs = 0;
+  ghostUntilMs = 0;
+  gpaDetHist = 0;
+  gpaConfirmedDetect = false;
+
+  autoState = AUTO_SEARCH;
+  prevStateDrawn = (AutoState)255;
+
+  searchPulseStartMs = 0;
+  shiftPulseStartMs  = 0;
+  shiftArmed = false;
+  g_latestFilteredIdx = -1;
+
+  stepPhase = PH_FWD;
+  stepPhaseStartMs = 0;
+
+  dist1 = dist2 = dist3 = dist4 = -1;
+  usIndex = 0;
+  lastUsFrontMs = millis();
+
+  targetInTolSinceMs = 0;
+  turnPulseStartMs = 0;
+  turnDirFixed = 0;
+
+  wallBackStartMs = 0;
+  rightAvoidStartMs = 0;
+
+  resumeState = AUTO_SEARCH;
+  backFwdStartMs = 0;
+
+  // UI first draw
+  // we will draw these on first LCD tick
+  Serial.println("Ready:");
+  Serial.println(" - Press BTN47 or BTN48 at start to store opponent-goal forward heading.");
+  Serial.println(" - While forward-driving and GPA!=111 and heading within +-80deg => kick 500ms.");
+}
+
+void loop() {
+  uint32_t now = millis();
+
+  // ---- solenoid timing (always) ----
+  updateKick(now);
+
+  // Front ultrasonic update (dist1)
+  if ((uint32_t)(now - lastUsFrontMs) >= US_FRONT_PERIOD_MS) {
+    lastUsFrontMs += US_FRONT_PERIOD_MS;
+    dist1 = readDistanceCM_timeout(TRIG_PIN, ECHO_PIN, US_TIMEOUT_US);
+  }
+
+  // 0) buttons: store target heading ("opponent goal forward")
+  bool pressed47 = pollPressedOnce(BTN47_PIN, btn47_lastRead, btn47_stable, btn47_changeMs);
+  bool pressed48 = pollPressedOnce(BTN48_PIN, btn48_lastRead, btn48_stable, btn48_changeMs);
+  if (pressed47 || pressed48) {
+    circleType = pressed47 ? CIRCLE_RED : CIRCLE_WHITE;
+    circleUntilMs = now + CIRCLE_SHOW_MS;
+
+    float curHdg = 0.0f;
+    bool hasValue = false;
+    (void)getHeadingFastThenStable(curHdg, hasValue);
+    if (hasValue) {
+      targetHdgDeg = curHdg;     // ✅ 기억(상대편 골 방향)
+      targetHdgSet = true;
+      Serial.print("[BTN] opponent-goal heading stored: "); Serial.println(targetHdgDeg, 1);
+    } else {
+      Serial.println("[BTN] heading not available");
+    }
+  }
+
+  // 1) IR polling + state machine control
+  if (now - lastIrPollMs >= IR_POLL_MS) {
+    lastIrPollMs += IR_POLL_MS;
+
+    // read IR
+    readMCP_AB_fast(lastGPA, lastGPB);
+
+    // GPA raw detect (킥은 "한번만 검출" 조건이라 rawDetect 그대로 사용)
+    bool rawDetect = (lastGPA != 0x07);
+
+    // GPA blue (표시만) - 기존 로직 유지
+    gpaDetHist = ((gpaDetHist << 1) | (rawDetect ? 1 : 0)) & ((1 << GPA_HIST_N) - 1);
+    gpaConfirmedDetect = (popcount8(gpaDetHist) >= GPA_CONFIRM_K);
+    if (gpaConfirmedDetect) {
+      gpaState = GPA_SOLID;
+      solidUntilMs = now + GPA_SOLID_MS;
+      ghostUntilMs = 0;
+    } else {
+      if (gpaState == GPA_SOLID && (int32_t)(now - solidUntilMs) >= 0) {
+        gpaState = GPA_GHOST;
+        ghostUntilMs = now + GPA_GHOST_MS;
+      } else if (gpaState == GPA_GHOST && (int32_t)(now - ghostUntilMs) >= 0) {
+        gpaState = GPA_OFF;
+      }
+    }
+
+    int rawIdx = gpbToIndex(lastGPB);
+    int idx = filterIRIndex(rawIdx);
+    g_latestFilteredIdx = idx;
+
+    if (idx >= 0) if (dirCount[idx] < 255) dirCount[idx]++;
+    if (now - modeWindowStartMs >= MODE_WINDOW_MS) resetModeWindow();
+
+    // current heading
+    float curHdg = 0.0f;
+    bool hasHdg = false;
+    (void)getHeadingFastThenStable(curHdg, hasHdg);
+
+    bool idxFrontOk = (g_latestFilteredIdx == 0 || g_latestFilteredIdx == 7);
+    bool arrivedAtBall = idxFrontOk && (dist1 > 0.0f && dist1 <= ARRIVE_CM);
+
+    bool wallTooClose = (dist1 > 0.0f && dist1 <= WALL_STOP_CM);
+    bool rightWallTooClose = (dist4 > 0.0f && dist4 <= RIGHT_WALL_AVOID_CM);
+
+    if (rightWallLatch) {
+      if (dist4 < 0.0f || dist4 > RIGHT_WALL_CLEAR_CM) rightWallLatch = false;
+    }
+
+    // priority: if BACK too close => forward 100ms then resume
+    bool backTooClose = (dist3 > 0.0f && dist3 <= BACK_TOO_CLOSE_CM);
+    if (backTooCloseLatch) {
+      if (dist3 < 0.0f || dist3 > BACK_CLEAR_CM) backTooCloseLatch = false;
+    }
+    if (backTooClose && !backTooCloseLatch && autoState != AUTO_FWD_FROM_BACK) {
+      backTooCloseLatch = true;
+      resumeState = autoState;
+      autoState = AUTO_FWD_FROM_BACK;
+      backFwdStartMs = now;
+      Serial.print("[PRIORITY] BACK(dist3)<=10cm ("); Serial.print(dist3, 1);
+      Serial.println(") -> FORWARD 100ms then resume");
+    }
+
+    // ✅ NEW: Kick trigger (GPA once) while forward-driving AND heading within +-80 deg of stored goal
+    // - only if heading available + target set + not currently firing + cooldown passed
+    if (!solenoidActive &&
+        (int32_t)(now - solenoidCooldownUntilMs) >= 0 &&
+        rawDetect &&
+        isForwardDrivingNow() &&
+        hasHdg &&
+        isHeadingWithinGoalWindow(curHdg))
+    {
+      startKick(now);
+    }
+
+    // --- state machine ---
+    switch (autoState) {
+      case AUTO_FWD_FROM_BACK: {
+        if (backFwdStartMs == 0) backFwdStartMs = now;
+        if ((uint32_t)(now - backFwdStartMs) < BACK_FWD_MS) {
+          motorForwardFixed(DUTY_FWD);
+        } else {
+          motorStop();
+          backFwdStartMs = 0;
+          autoState = resumeState;
+          Serial.println("[PRIORITY] done -> RESUME");
+        }
+      } break;
+
+      case AUTO_SEARCH: {
+        shiftArmed = false;
+        targetInTolSinceMs = 0;
+        turnPulseStartMs = 0;
+        turnDirFixed = 0;
+        wallBackStartMs = 0;
+
+        if (rightWallTooClose && !rightWallLatch) {
+          motorStop();
+          rightWallLatch = true;
+          autoState = AUTO_AVOID_RIGHT_WALL;
+          rightAvoidStartMs = now;
+          searchPulseStartMs = 0;
+          Serial.print("[SEARCH] RIGHT(dist4) <=20cm ("); Serial.print(dist4, 1);
+          Serial.println(") -> AVOID BACK+RIGHT 300ms");
+          break;
+        }
+
+        if (idx == 0 && hasHdg) {
+          motorStop();
+          autoState = AUTO_SHIFT;
+          shiftPulseStartMs = 0;
+          shiftStartDeg  = curHdg;
+          shiftTargetDeg = wrap360(shiftStartDeg - SHIFT_DEG);
+          shiftArmed     = true;
+          Serial.print("[SEARCH->SHIFT] start="); Serial.print(shiftStartDeg, 2);
+          Serial.print(" target="); Serial.println(shiftTargetDeg, 2);
+          break;
+        }
+
+        if (idx < 0) {
+          motorStop();
+          searchPulseStartMs = 0;
+          break;
+        }
+
+        uint16_t searchOnMs = SEARCH_ON_MS_NEAR;
+        if (idx == 1) searchOnMs = SEARCH_ON_MS_NEAR;
+        else if (idx >= 2) searchOnMs = SEARCH_ON_MS_FAR;
+
+        motorTurnLeftPulse(now, searchPulseStartMs, SEARCH_PULSE_PERIOD_MS, searchOnMs, DUTY_SEARCH_PULSE);
+      } break;
+
+      case AUTO_AVOID_RIGHT_WALL: {
+        if (rightAvoidStartMs == 0) rightAvoidStartMs = now;
+        uint32_t dt = (uint32_t)(now - rightAvoidStartMs);
+
+        if (dt < RIGHT_AVOID_MS) {
+          motorBackRightArc(DUTY_FWD);
+        } else {
+          motorStop();
+          rightAvoidStartMs = 0;
+          autoState = AUTO_SEARCH;
+          searchPulseStartMs = 0;
+          Serial.println("[AVOID_RIGHT_WALL] done -> SEARCH");
+        }
+      } break;
+
+      case AUTO_SHIFT: {
+        if (!hasHdg || !shiftArmed) {
+          motorStop();
+          break;
+        }
+        float ccwErr = 360.0f - cwDiffDeg(curHdg, shiftTargetDeg);
+        if (ccwErr <= SHIFT_TOL_DEG) {
+          motorStop();
+          shiftPulseStartMs  = 0;
+          searchPulseStartMs = 0;
+          shiftArmed = false;
+          if (g_latestFilteredIdx == 0) {
+            autoState = AUTO_STEP_FWD;
+            stepPhase = PH_FWD;
+            stepPhaseStartMs = now;
+            Serial.println("[SHIFT] done -> STEP_FWD (idx==0)");
+          } else {
+            autoState = AUTO_SEARCH;
+            Serial.println("[SHIFT] done -> SEARCH (idx!=0)");
+          }
+          break;
+        }
+        motorTurnLeftPulse(now, shiftPulseStartMs, SHIFT_PULSE_PERIOD_MS, SHIFT_PULSE_ON_MS, DUTY_SHIFT_PULSE);
+      } break;
+
+      case AUTO_STEP_FWD: {
+        if (!(g_latestFilteredIdx == 0 || g_latestFilteredIdx == 7)) {
+          motorStop();
+          autoState = AUTO_SEARCH;
+          searchPulseStartMs = 0;
+          shiftPulseStartMs  = 0;
+          shiftArmed = false;
+          stepPhaseStartMs = 0;
+          targetInTolSinceMs = 0;
+          turnPulseStartMs = 0;
+          turnDirFixed = 0;
+          wallBackStartMs = 0;
+          Serial.println("[STEP_FWD] idx not (0/7) -> SEARCH");
+          break;
+        }
+
+        if (stepPhase == PH_FWD && wallTooClose) {
+          motorStop();
+          autoState = AUTO_BACK_FROM_WALL;
+          wallBackStartMs = now;
+          searchPulseStartMs = 0;
+          shiftPulseStartMs  = 0;
+          shiftArmed = false;
+          stepPhaseStartMs = 0;
+          targetInTolSinceMs = 0;
+          turnPulseStartMs = 0;
+          turnDirFixed = 0;
+          Serial.print("[STEP_FWD] WALL<=30cm ("); Serial.print(dist1, 1);
+          Serial.println(") -> BACK 200ms -> SEARCH");
+          break;
+        }
+
+        if (arrivedAtBall) {
+          motorStop();
+          autoState = AUTO_TURN_TO_TARGET;
+          targetInTolSinceMs = 0;
+          turnPulseStartMs = 0;
+          turnDirFixed = 0;
+          wallBackStartMs = 0;
+          Serial.println("[STEP_FWD] arrived(front<=5cm & idx0/7) -> TURN_TO_TARGET");
+          break;
+        }
+
+        if (stepPhaseStartMs == 0) stepPhaseStartMs = now;
+
+        if (stepPhase == PH_FWD) {
+          motorForwardFixed(DUTY_FWD);
+          if ((uint32_t)(now - stepPhaseStartMs) >= STEP_FWD_MS) {
+            stepPhase = PH_STOP;
+            stepPhaseStartMs = now;
+            motorStop();
+          }
+        } else {
+          motorStop();
+          if ((uint32_t)(now - stepPhaseStartMs) >= STEP_STOP_MS) {
+            stepPhase = PH_FWD;
+            stepPhaseStartMs = now;
+          }
+        }
+      } break;
+
+      case AUTO_TURN_TO_TARGET: {
+        if (!(g_latestFilteredIdx == 0 || g_latestFilteredIdx == 7)) {
+          motorStop();
+          autoState = AUTO_SEARCH;
+          searchPulseStartMs = 0;
+          shiftPulseStartMs  = 0;
+          shiftArmed = false;
+          targetInTolSinceMs = 0;
+          turnPulseStartMs = 0;
+          turnDirFixed = 0;
+          wallBackStartMs = 0;
+          Serial.println("[TURN_TO_TARGET] idx lost -> SEARCH");
+          break;
+        }
+        if (!targetHdgSet || !hasHdg) {
+          motorStop();
+          autoState = AUTO_SEARCH;
+          searchPulseStartMs = 0;
+          shiftPulseStartMs  = 0;
+          shiftArmed = false;
+          targetInTolSinceMs = 0;
+          turnPulseStartMs = 0;
+          turnDirFixed = 0;
+          wallBackStartMs = 0;
+          Serial.println("[TURN_TO_TARGET] target/hdg missing -> SEARCH");
+          break;
+        }
+
+        float err = signedDiffDeg(curHdg, targetHdgDeg);
+        float aerr = fabsf(err);
+
+        if (aerr <= TARGET_TOL_DEG) {
+          motorStop();
+          turnPulseStartMs = 0;
+          turnDirFixed = 0;
+          if (targetInTolSinceMs == 0) targetInTolSinceMs = now;
+          if ((uint32_t)(now - targetInTolSinceMs) >= TARGET_SETTLE_MS) {
+            autoState = AUTO_DRIVE_AFTER_TURN;
+            targetInTolSinceMs = 0;
+            Serial.println("[TURN_TO_TARGET] done -> DRIVE_AFTER_TURN");
+          }
+          break;
+        } else {
+          targetInTolSinceMs = 0;
+        }
+
+        if (turnDirFixed == 0) {
+          turnDirFixed = (err >= 0.0f) ? +1 : -1;
+        }
+
+        motorTurnPulseDir(now, turnPulseStartMs,
+                          TURN_PULSE_PERIOD_MS, TURN_PULSE_ON_MS,
+                          DUTY_TURN_PULSE, turnDirFixed);
+      } break;
+
+      case AUTO_DRIVE_AFTER_TURN: {
+        if (!(g_latestFilteredIdx == 0 || g_latestFilteredIdx == 7)) {
+          motorStop();
+          autoState = AUTO_SEARCH;
+          searchPulseStartMs = 0;
+          shiftPulseStartMs  = 0;
+          shiftArmed = false;
+          targetInTolSinceMs = 0;
+          turnPulseStartMs = 0;
+          turnDirFixed = 0;
+          wallBackStartMs = 0;
+          Serial.println("[DRIVE_AFTER_TURN] idx lost -> SEARCH");
+          break;
+        }
+
+        if (wallTooClose) {
+          motorStop();
+          autoState = AUTO_BACK_FROM_WALL;
+          wallBackStartMs = now;
+          searchPulseStartMs = 0;
+          shiftPulseStartMs  = 0;
+          shiftArmed = false;
+          targetInTolSinceMs = 0;
+          turnPulseStartMs = 0;
+          turnDirFixed = 0;
+          Serial.print("[DRIVE_AFTER_TURN] WALL<=30cm ("); Serial.print(dist1, 1);
+          Serial.println(") -> BACK 200ms -> SEARCH");
+          break;
+        }
+
+        motorForwardFixed(DUTY_FWD);
+      } break;
+
+      case AUTO_BACK_FROM_WALL: {
+        if (wallBackStartMs == 0) wallBackStartMs = now;
+
+        if ((uint32_t)(now - wallBackStartMs) < WALL_BACK_MS) {
+          motorBackwardFixed(DUTY_FWD);
+        } else {
+          motorStop();
+          wallBackStartMs = 0;
+
+          autoState = AUTO_SEARCH;
+          searchPulseStartMs = 0;
+          shiftPulseStartMs  = 0;
+          shiftArmed = false;
+          stepPhaseStartMs = 0;
+          targetInTolSinceMs = 0;
+          turnPulseStartMs = 0;
+          turnDirFixed = 0;
+
+          Serial.println("[BACK_FROM_WALL] done -> SEARCH");
+        }
+      } break;
+    }
+  }
+
+  // 2) LCD update (display; includes other US sensors)
+  if (now - lastLcdMs >= LCD_UPDATE_MS) {
+    lastLcdMs += LCD_UPDATE_MS;
+
+    switch (usIndex) {
+      case 0: dist2 = readDistanceCM_timeout(TRIG_PIN2, ECHO_PIN2, US_TIMEOUT_US); break; // left
+      case 1: dist3 = readDistanceCM_timeout(TRIG_PIN3, ECHO_PIN3, US_TIMEOUT_US); break; // back
+      case 2: dist4 = readDistanceCM_timeout(TRIG_PIN4, ECHO_PIN4, US_TIMEOUT_US); break; // right
+      case 3: /* no-op */ break;
+    }
+    usIndex = (usIndex + 1) & 0x03;
+
+    drawValueInCellRoundedCM(cellRight, dist1); // front
+    drawValueInCellRoundedCM(cellUp,    dist2); // left
+    drawValueInCellRoundedCM(cellLeft,  dist3); // back
+    drawValueInCellRoundedCM(cellDown,  dist4); // right
+
+    // IR text + IDX
+    tft.fillRect(irTextX, irTextY, irTextW, irTextH, ST77XX_BLACK);
+    tft.setTextSize(1);
+    tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+    tft.setCursor(irTextX, irTextY);
+    tft.print("GPA=");
+    for (int i = 2; i >= 0; i--) tft.print((lastGPA & (1 << i)) ? '1' : '0');
+    tft.setCursor(irTextX, irTextY + 12);
+    tft.print("GPB=");
+    for (int i = 7; i >= 0; i--) tft.print((lastGPB & (1 << i)) ? '1' : '0');
+
+    drawIDXText(g_latestFilteredIdx);
+
+    // State text
+    drawStateText(autoState);
+
+    // Ball direction arrow smoothing
+    int modeIdx = getModeIndex();
+    if (modeIdx >= 0) {
+      float newDeg = indexToDeg(modeIdx);
+      if (fabsf(newDeg - arrowDeg) > 0.1f) {
+        drawThickArrow(cx, cy, r - 2, arrowDeg, 6, ST77XX_BLACK);
+        arrowDeg = newDeg;
+        drawThickArrow(cx, cy, r - 2, arrowDeg, 6, ST77XX_YELLOW);
+      }
+    }
+
+    // Heading + target heading UI
+    float hdg = 0.0f;
+    bool hasValue = false;
+    bool reliable = getHeadingFastThenStable(hdg, hasValue);
+
+    drawThinShortArrow(cx, cy, (int)(r * 0.55f), prevHeadingArrowDeg, ST77XX_BLACK);
+    if (hasValue) {
+      uint16_t hdgColor = reliable ? ST77XX_WHITE : ST77XX_RED;
+      tft.fillRect(hdgTextX, hdgTextY, hdgTextW, hdgTextH, ST77XX_BLACK);
+      tft.setTextSize(2);
+      tft.setTextColor(hdgColor, ST77XX_BLACK);
+      tft.setCursor(hdgTextX, hdgTextY);
+      tft.print("HDG=");
+      tft.print(String(hdg, 1));
+
+      headingArrowDeg = hdg;
+      drawThinShortArrow(cx, cy, (int)(r * 0.55f), headingArrowDeg, ST77XX_RED);
+      prevHeadingArrowDeg = headingArrowDeg;
+    } else {
+      tft.fillRect(hdgTextX, hdgTextY, hdgTextW, hdgTextH, ST77XX_BLACK);
+      tft.setTextSize(2);
+      tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
+      tft.setCursor(hdgTextX, hdgTextY);
+      tft.print("HDG=---");
+    }
+
+    // target heading text
+    tft.fillRect(thdgTextX, thdgTextY, thdgTextW, thdgTextH, ST77XX_BLACK);
+    tft.setTextSize(2);
+    tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
+    tft.setCursor(thdgTextX, thdgTextY);
+    if (!targetHdgSet) tft.print("tHDG=---");
+    else { tft.print("tHDG="); tft.print(targetHdgDeg, 1); }
+
+    // target arrow
+    if (targetHdgSet) {
+      drawThinShortArrow(cx, cy, (int)(r * 0.80f), prevTargetArrowDeg, ST77XX_BLACK);
+      drawThinShortArrow(cx, cy, (int)(r * 0.80f), targetHdgDeg, ST77XX_GREEN);
+      prevTargetArrowDeg = targetHdgDeg;
+    } else {
+      drawThinShortArrow(cx, cy, (int)(r * 0.80f), prevTargetArrowDeg, ST77XX_BLACK);
+    }
+
+    // overlays
+    if (gpaState != prevGpaState) {
+      drawGPABlueCircleOverlay(gpaState);
+      prevGpaState = gpaState;
+    }
+    drawButtonCircleOverlay(now);
+  }
+
+  // 3) circle overlay timeout
+  if (circleType != CIRCLE_NONE && now >= circleUntilMs) {
+    circleType = CIRCLE_NONE;
+    drawButtonCircleOverlay(now);
+  }
+}
